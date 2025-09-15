@@ -1,55 +1,56 @@
-# models/score.py
+# models/score.py — инференс квантилей по заданному горизонту
 import pickle
+from typing import Dict, Optional
+
 import numpy as np
 import pandas as pd
 
+def _predict_quantiles_for_row(row: pd.Series,
+                               bundle: Dict,
+                               qmodels: Dict[float, object]) -> Dict[str, float]:
+    feats = bundle["features"]
+    scale_col = bundle.get("scale_col", "sigma_ewma_7d")
+    lam = float(bundle.get("lambda_width", 1.0))
 
-def predict_7d_price(df: pd.DataFrame, models_path: str = 'models/quantile_models.pkl') -> dict:
-    """
-    Прогноз цены через 7д на основе квантильных моделей.
-    Ожидаем, что в models_path лежит payload вида:
-      {'models': {q: LGBMRegressor(...), ...},
-       'features': [list],
-       'scale_col': 'sigma_ewma_7d' | 'sigma_7d',
-       'lambda_width': float}
-    Возвращает словарь с уровнями P10/P50/P90 и шириной диапазона.
-    """
-    with open(models_path, 'rb') as f:
+    x = row[feats].to_frame().T.astype(float)
+    now_price = float(row["close"])
+    sigma = float(max(float(row.get(scale_col, np.nan)), 1e-8))
+
+    # scaled y*
+    yq = {q: float(qmodels[q].predict(x)[0]) * sigma for q in qmodels}
+    qs = sorted(yq.keys())
+    vals = np.array([yq[q] for q in qs], dtype=float)
+    vals.sort()
+    yq = {qs[i]: float(vals[i]) for i in range(len(qs))}
+
+    med = float(yq.get(0.5, 0.0))
+    y_lo = med + lam * (float(yq.get(0.1, med)) - med)
+    y_hi = med + lam * (float(yq.get(0.9, med)) - med)
+
+    P10 = now_price * np.exp(y_lo)
+    P50 = now_price * np.exp(med)
+    P90 = now_price * np.exp(y_hi)
+    width_pct = 100.0 * (P90 - P10) / now_price if now_price > 0 else float("nan")
+    return {"now_price": now_price, "P10": P10, "P50": P50, "P90": P90, "width_pct": float(width_pct)}
+
+def predict_price(df: pd.DataFrame,
+                  models_path: str = "models/quantile_models.pkl",
+                  horizon_hours: Optional[int] = None) -> Dict[str, float]:
+    """Берём последнюю строку df и считаем P10/P50/P90 для горизонта."""
+    with open(models_path, "rb") as f:
         payload = pickle.load(f)
 
-    qmodels = payload['models']
-    feature_cols = payload['features']
-    scale_col = payload.get('scale_col', 'sigma_7d')
-    lam = float(payload.get('lambda_width', 1.0))
-
     last = df.iloc[[-1]]
-    now_price = float(last['close'].iloc[0])
-    sigma = float(last[scale_col].clip(lower=1e-8).iloc[0])
-
-    # предсказания в масштабе y* (scaled), затем обратно в y
-    preds_scaled = {q: float(qmodels[q].predict(last[feature_cols])[0]) for q in qmodels}
-    yq = {q: preds_scaled[q] * sigma for q in preds_scaled}
-
-    # non-crossing + shrink к медиане через λ
-    qs = sorted(yq.keys())
-    arr = np.array([yq[q] for q in qs])
-    arr.sort()
-    yq = {qs[i]: arr[i] for i in range(len(qs))}
-    if 0.5 in yq and 0.1 in yq and 0.9 in yq:
-        med = yq[0.5]
-        yq[0.1] = med + lam * (yq[0.1] - med)
-        yq[0.9] = med + lam * (yq[0.9] - med)
-
-    P10 = now_price * np.exp(yq.get(0.1, np.nan))
-    P50 = now_price * np.exp(yq.get(0.5, np.nan))
-    P90 = now_price * np.exp(yq.get(0.9, np.nan))
-
-    width_pct = 100.0 * (P90 - P10) / now_price if now_price > 0 else np.nan
-
-    return {
-        "now_price": now_price,
-        "P10": float(P10),
-        "P50": float(P50),
-        "P90": float(P90),
-        "width_pct": float(width_pct),
-    }
+    # новый формат: payload['by_horizon'][H]
+    if "by_horizon" in payload:
+        if horizon_hours is None:
+            horizon_hours = int(payload.get("default_horizon", 4))
+        # ближайший доступный
+        Hs = sorted([int(h) for h in payload["by_horizon"].keys()])
+        H = min(Hs, key=lambda x: abs(x - int(horizon_hours)))
+        bundle = payload["by_horizon"][H]
+        return _predict_quantiles_for_row(last.iloc[0], bundle, bundle["models"])
+    else:
+        # старый формат
+        bundle = payload
+        return _predict_quantiles_for_row(last.iloc[0], bundle, bundle["models"])

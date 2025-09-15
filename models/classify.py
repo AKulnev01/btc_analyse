@@ -1,18 +1,15 @@
-# models/classify.py — бинарные головы: P(up), P(big_move) + калибровка
+# models/classify.py — бинарные головы: P(up > X%), P(down > X%) с Platt-калибровкой, по нескольким горизонтам
 import pickle
+from typing import List, Dict, Optional
+
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.linear_model import LogisticRegression
-from typing import Dict, Optional, Union, List
 
-# Порог «крупного хода» (лог-доходность за 7д ~ 6%)
-BIG_MOVE_PCT = 0.06  # 6%
-
-# Общие параметры для классификатора
+# Базовые параметры
 LGB_PARAMS_CLF = dict(
     n_estimators=2000,
     learning_rate=0.05,
@@ -20,138 +17,117 @@ LGB_PARAMS_CLF = dict(
     max_depth=-1,
     min_data_in_leaf=50,
     min_sum_hessian_in_leaf=1e-3,
-    feature_fraction=0.9,     # используем feature_fraction вместо colsample_bytree
+    feature_fraction=0.9,
     subsample=0.9,
     subsample_freq=1,
     reg_lambda=5.0,
     min_split_gain=0.0,
     max_bin=511,
     force_row_wise=True,
-    objective="binary",
+    objective='binary',
     n_jobs=-1,
     verbosity=-1,
 )
 
+# Пороги для "up/down > X%" — в долях (0.005 = 0.5%)
+try:
+    import config as CFG
+    UP_THR_PCT = getattr(CFG, "UP_THR_PCT", {1: 0.002, 4: 0.005, 24: 0.02})
+    TARGET_HOURS = int(getattr(CFG, "TARGET_HOURS", 4))
+    MULTI_HOURS = list(dict.fromkeys(
+        [1, 4, 24] + list(getattr(CFG, "MULTI_TARGET_HOURS", [])) + [TARGET_HOURS]
+    ))
+except Exception:
+    UP_THR_PCT = {1: 0.002, 4: 0.005, 24: 0.02}
+    TARGET_HOURS = 4
+    MULTI_HOURS = [1, 4, 24, 4]
+
+def _log_thr(pct):
+    # перевод порога в лог-доходность
+    return float(np.log1p(float(pct)))
+
 class PlattWrapper:
-    """Обертка: LGBM + Platt-калибровка вероятностей."""
     def __init__(self, base, platt):
         self.base = base
         self.platt = platt
     def predict_proba(self, X):
         p_raw = self.base.predict_proba(X)[:, 1]
-        p_cal = self.platt.predict_proba(p_raw.reshape(-1,1))[:,1]
+        p_cal = self.platt.predict_proba(p_raw.reshape(-1, 1))[:, 1]
         return np.vstack([1.0 - p_cal, p_cal]).T
 
+def _fit_one_head(Xtr, ytr, Xva, yva, class_weight) -> (PlattWrapper, Dict[str, float]):
+    base = LGBMClassifier(**LGB_PARAMS_CLF, class_weight=class_weight)
+    base.fit(Xtr, ytr)
+    # калибровка Platt по train
+    p_tr = base.predict_proba(Xtr)[:, 1]
+    p_va = base.predict_proba(Xva)[:, 1]
+    cal = LogisticRegression(max_iter=1000)
+    # защита от одного класса
+    if len(np.unique(ytr)) < 2:
+        cal.classes_ = np.array([0, 1])
+        cal.coef_ = np.zeros((1, 1))
+        cal.intercept_ = np.zeros(1)
+        cal.n_features_in_ = 1
+    else:
+        cal.fit(p_tr.reshape(-1, 1), ytr)
+    p_va_cal = cal.predict_proba(p_va.reshape(-1, 1))[:, 1]
+    # метрики
+    out = dict(
+        logloss=float(log_loss(yva, p_va_cal, labels=[0, 1])),
+        brier=float(brier_score_loss(yva, p_va_cal)),
+        auc=float(roc_auc_score(yva, p_va_cal)) if len(np.unique(yva)) == 2 else float("nan"),
+    )
+    return PlattWrapper(base, cal), out
 
-def make_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """Из непрерывной цели y делаем две бинарные метки."""
-    out = df.copy()
-    out['y_up']  = (out['y'] > 0).astype(int)
-    out['y_big'] = (out['y'].abs() > BIG_MOVE_PCT).astype(int)
-    return out
-
-def _fit_base(X, y, class_weight):
-    return LGBMClassifier(
-        **LGB_PARAMS_CLF,
-        class_weight=class_weight
-    ).fit(X, y)
-
-def _fit_platt(p_raw: np.ndarray, y: np.ndarray) -> LogisticRegression:
+def train_binary_heads(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    horizons: Optional[List[int]] = None,
+    out_path: str = 'models/binary_heads.pkl'
+) -> Dict[str, PlattWrapper]:
     """
-    Плати-калибровка: логрег по scalar-признаку p_raw.
-    Защищаемся от случая одного класса (возвращаем «тривиальный» калибратор).
+    Для каждого горизонта H из horizons создаёт две головы:
+      - y_up_thr_h{H}: 1 если y_h{H} >= log(1+thr)
+      - y_down_thr_h{H}: 1 если y_h{H} <= -log(1+thr)
+    Возвращает словарь {label_name: PlattWrapper} и сохраняет его.
     """
-    lr = LogisticRegression(max_iter=1000)
-    if len(np.unique(y)) < 2:
-        lr.classes_ = np.array([0, 1])
-        lr.coef_ = np.zeros((1, 1))
-        lr.intercept_ = np.zeros(1)
-        lr.n_features_in_ = 1
-        return lr
-    lr.fit(p_raw.reshape(-1, 1), y)
-    return lr
+    horizons = horizons or list(dict.fromkeys(MULTI_HOURS))
+    feats = [c for c in feature_cols if (c in df.columns and df[c].dtype.kind != 'O')]
 
-def train_binary_heads(df, feature_cols, save_path='models/binary_heads.pkl'):
-    """
-    Обучаем две головы (y_up, y_big) с Platt-калибровкой вероятностей.
-    Возвращаем dict {target: PlattWrapper} и логируем метрики.
-    """
-    df = make_labels(df)
-    feature_cols = [c for c in feature_cols if c in df.columns and df[c].dtype.kind != 'O']
-    cv = TimeSeriesSplit(n_splits=5)
+    results: Dict[str, PlattWrapper] = {}
+    logs: Dict[str, Dict[str, float]] = {}
 
-    results = {}
-    for target in ['y_up', 'y_big']:
-        ll_list, br_list, auc_list = [], [], []
+    for H in horizons:
+        ycol = f"y_h{H}" if f"y_h{H}" in df.columns else "y"
+        if ycol not in df.columns:
+            continue
+        thr = _log_thr(UP_THR_PCT.get(H, 0.005))
 
-        classes = np.array([0, 1])
-        weights = compute_class_weight('balanced', classes=classes, y=df[target].values)
-        class_weight = {0: float(weights[0]), 1: float(weights[1])}
+        d = df.dropna(subset=[ycol]).copy()
+        X = d[feats].astype(float)
+        y_up = (d[ycol] >= thr).astype(int)
+        y_dn = (d[ycol] <= -thr).astype(int)
 
-        # walk-forward оценка
-        for tr_idx, va_idx in cv.split(df):
-            Xtr, ytr = df.iloc[tr_idx][feature_cols].astype(float), df.iloc[tr_idx][target].astype(int)
-            Xva, yva = df.iloc[va_idx][feature_cols].astype(float), df.iloc[va_idx][target].astype(int)
+        split = int(len(d) * 0.8)
+        Xtr, Xva = X.iloc[:split], X.iloc[split:]
+        yup_tr, yup_va = y_up.iloc[:split], y_up.iloc[split:]
+        ydn_tr, ydn_va = y_dn.iloc[:split], y_dn.iloc[split:]
 
-            base = _fit_base(Xtr, ytr, class_weight)
-            p_tr = base.predict_proba(Xtr)[:, 1]
-            p_va = base.predict_proba(Xva)[:, 1]
+        for name, ytr, yva in [ (f"y_up_thr_h{H}", yup_tr, yup_va), (f"y_down_thr_h{H}", ydn_tr, ydn_va) ]:
+            classes = np.array([0, 1])
+            weights = compute_class_weight('balanced', classes=classes, y=ytr.values)
+            class_weight = {0: float(weights[0]), 1: float(weights[1])}
+            model, mlog = _fit_one_head(Xtr, ytr, Xva, yva, class_weight)
+            results[name] = model
+            logs[name] = mlog
+            print(f"{name}: logloss={mlog['logloss']:.4f}, brier={mlog['brier']:.4f}, auc={mlog['auc']:.4f}")
 
-            cal = _fit_platt(p_tr, ytr)
-            p_va_cal = cal.predict_proba(p_va.reshape(-1, 1))[:, 1]
+    # бэквард-совместимость: сделаем alias для текущего TARGET_HOURS
+    H0 = int(getattr(CFG, "TARGET_HOURS", TARGET_HOURS))
+    if f"y_up_thr_h{H0}" in results:
+        results["y_up"] = results[f"y_up_thr_h{H0}"]
 
-            ll_list.append(log_loss(yva, p_va_cal, labels=[0, 1]))
-            br_list.append(brier_score_loss(yva, p_va_cal))
-            try:
-                auc_list.append(roc_auc_score(yva, p_va_cal))
-            except ValueError:
-                pass
-
-        print(f"{target}: logloss={np.mean(ll_list):.4f}, "
-              f"brier={np.mean(br_list):.4f}, "
-              f"auc={np.mean(auc_list) if auc_list else float('nan'):.4f}")
-
-        # финальная модель на всём датасете
-        base_full = LGBMClassifier(**LGB_PARAMS_CLF, class_weight=class_weight)
-        X_all, y_all = df[feature_cols], df[target]
-        base_full.fit(X_all, y_all)
-        p_all = base_full.predict_proba(X_all)[:, 1]
-        platt_full = _fit_platt(p_all, y_all)
-
-        results[target] = PlattWrapper(base_full, platt_full)
-
-    payload = {'models': results, 'features': feature_cols}
-    with open(save_path, 'wb') as f:
+    payload = {'models': results, 'features': feats, 'logs': logs, 'horizons': horizons, 'up_thr_pct': UP_THR_PCT}
+    with open(out_path, 'wb') as f:
         pickle.dump(payload, f)
-
     return results
-
-def _ensure_df_row(x) -> pd.DataFrame:
-    """Принимаем Series/DataFrame/словарь — возвращаем DataFrame с 1 строкой."""
-    if isinstance(x, pd.Series):
-        return x.to_frame().T
-    if isinstance(x, dict):
-        return pd.DataFrame([x])
-    return x  # уже DataFrame
-
-def predict_probs(models_path: str, last_features) -> dict:
-    """
-    Инференс вероятностей P_up и P_big из сохранённых бинарных голов.
-    """
-    with open(models_path, 'rb') as f:
-        payload = pickle.load(f)
-
-    models = payload.get('models', payload)
-    feat = payload.get('features', None)
-
-    Xall = _ensure_df_row(last_features)
-    if feat is None:
-        feat = [c for c in Xall.columns if c not in ('y','close') and Xall[c].dtype.kind != 'O']
-    X = Xall[feat].astype(float)
-
-    out = {}
-    for key, model in models.items():
-        tgt = 'P_up' if 'up' in key else ('P_big' if 'big' in key else f"P_{key}")
-        proba = model.predict_proba(X)[:, 1]
-        out[tgt] = float(proba[-1])
-    return out

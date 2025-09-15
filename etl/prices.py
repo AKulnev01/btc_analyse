@@ -1,33 +1,74 @@
-"""Загрузка OHLCV и приведение к часовой сетке.
-Поддерживает файлы, где timestamp либо в колонке, либо уже в индексе.
-"""
+# etl/prices.py
 import pandas as pd
+import numpy as np
+import config as CFG
 
-def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Гарантируем DatetimeIndex в UTC, независимо от того, в колонке ли timestamp или уже в индексе."""
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
-        df = df.set_index('timestamp')
+OHLC_AGG = {
+    "open": "first",
+    "high": "max",
+    "low":  "min",
+    "close":"last",
+    "volume":"sum",
+}
+
+def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    idx = pd.to_datetime(d.index, utc=True)
+    d.index = idx
+    d = d.sort_index()
+    return d
+
+def _maybe_resample(df: pd.DataFrame, bar: str) -> pd.DataFrame:
+    """Ресемплим к нужной сетке BAR, если исходные данные не совпадают."""
+    d = df.copy()
+    # если уже ровно в нужной частоте
+    try:
+        infer = pd.infer_freq(d.index)
+    except Exception:
+        infer = None
+    if infer == bar:
+        return d
+
+    # ресемпл до BAR
+    d = (
+        d.resample(bar)
+         .agg(OHLC_AGG)
+         .dropna(subset=["open","high","low","close"])
+    )
+    # объём, если колонки нет — создадим нули
+    if "volume" not in d.columns:
+        d["volume"] = 0.0
+    return d
+
+def load_btc_prices(path: str = CFG.PX_FILE, bar: str = None) -> pd.DataFrame:
+    """
+    Грузим цены (parquet/csv), приводим к UTC и к CFG.BAR (или переданному).
+    Требуем колонки: open/high/low/close (+ volume по возможности).
+    """
+    bar = bar or CFG.BAR
+    if path.endswith(".parquet"):
+        df = pd.read_parquet(path)
     else:
-        # попытка интерпретировать индекс как datetime
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
-        elif df.index.tz is None:
-            df.index = df.index.tz_localize('UTC')
-        else:
-            df.index = df.index.tz_convert('UTC')
-    return df.sort_index()
+        df = pd.read_csv(path)
 
-def load_btc_prices(path: str) -> pd.DataFrame:
-    df = pd.read_parquet(path) if path.endswith('.parquet') else pd.read_csv(path)
-    df = _ensure_dt_index(df)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        # попробуем найти колонку с временем
+        for cand in ("timestamp","ts","time","date"):
+            if cand in df.columns:
+                df = df.set_index(cand)
+                break
 
-    # Если данные уже в 1H — ресемпл не повредит; агрегируем явно
-    out = pd.DataFrame({
-        'open':   df['open'].resample('1H').first(),
-        'high':   df['high'].resample('1H').max(),
-        'low':    df['low'].resample('1H').min(),
-        'close':  df['close'].resample('1H').last(),
-        'volume': df['volume'].resample('1H').sum(),
-    })
-    return out.dropna()
+    df = _ensure_utc_index(df)
+
+    # гарантируем нужные колонки
+    need = {"open","high","low","close"}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"load_btc_prices: отсутствуют колонки: {missing}")
+
+    # объём, если нет — создадим
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+
+    df = _maybe_resample(df, bar)
+    return df

@@ -1,3 +1,4 @@
+# evaluation/backtest_last_year.py
 import os
 import sys
 import argparse
@@ -55,9 +56,9 @@ def _train_quantile_block(
     if len(feats_used) == 0:
         raise ValueError("После фильтра покрытий не осталось фичей для обучения")
 
-    X_all = df_tr[feats_used].astype(float)
+    X_all = df_tr[feats_used]
     mask_rows = X_all.notna().all(axis=1) & y_scaled.notna()
-    X = X_all.loc[mask_rows]
+    X = X_all.loc[mask_rows].astype(float)
     y_scaled = y_scaled.loc[mask_rows]
     s = s.loc[mask_rows]
 
@@ -70,7 +71,7 @@ def _train_quantile_block(
     ytr, yva = y_scaled.iloc[:split], y_scaled.iloc[split:]
     s_va = s.iloc[split:]
 
-    # LGBM — параметры, чтобы избежать “No further splits”
+    # LGBM — параметры, чтобы избегать “No further splits”
     params = dict(
         n_estimators=6000,
         learning_rate=0.03,
@@ -128,6 +129,7 @@ def _train_quantile_block(
 
             # бакеты по σ на валидации
             q1, q2 = np.quantile(s_va.values, [1.0 / 3, 2.0 / 3])
+
             def vb(sig: float) -> str:
                 return "LOW" if sig <= q1 else ("MID" if sig <= q2 else "HIGH")
 
@@ -163,6 +165,7 @@ def _train_quantile_block(
 
                 # бакеты по σ на хвосте
                 q1_cal, q2_cal = np.quantile(s_tail.values, [1.0 / 3, 2.0 / 3])
+
                 def vb_tail(sig: float) -> str:
                     return "LOW" if sig <= q1_cal else ("MID" if sig <= q2_cal else "HIGH")
 
@@ -176,6 +179,7 @@ def _train_quantile_block(
                 qmap = {"LOW": 0.0, "MID": 0.0, "HIGH": 0.0}
 
     except Exception:
+        # оставим дефолты
         pass
 
     print(
@@ -253,6 +257,8 @@ def main() -> None:
         description="Walk-forward бэктест за последний год (ежечасные предикты на +HORIZON_H)."
     )
     ap.add_argument("--features", default=DEFAULT_FEAT, help="parquet фичей")
+    ap.add_argument("--retrain-hours", type=float, default=168.0,
+                    help="как часто переобучаем модели (в часах, можно 0.5)")
     ap.add_argument("--start-days", type=int, default=365, help="длина окна бэктеста в днях")
     ap.add_argument("--retrain-hours", type=int, default=168, help="как часто переобучаем модели")
     ap.add_argument("--coverage", type=float, default=0.70, help="целевое покрытие для калибровки [P10,P90]")
@@ -288,9 +294,9 @@ def main() -> None:
     iter_ts = df.loc[(df.index >= t_start_eval) & (df.index <= t_end_eval)].index
     for ts in iter_ts:
         need_retrain = (
-            models is None
-            or last_train_time is None
-            or ((ts - last_train_time) >= pd.Timedelta(hours=args.retrain_hours))
+                models is None
+                or last_train_time is None
+                or ((ts - last_train_time) >= pd.Timedelta(hours=args.retrain_hours))
         )
         if need_retrain:
             train_cutoff = ts - pd.Timedelta(hours=1)  # на момент t доступно всё до t-1h

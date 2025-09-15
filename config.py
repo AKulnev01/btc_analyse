@@ -48,6 +48,41 @@ BYBIT_API_SECRET  = os.getenv("BYBIT_API_SECRET", "")
 HTTP_PROXY        = os.getenv("HTTP_PROXY", "")
 HTTPS_PROXY       = os.getenv("HTTPS_PROXY", "")
 
-TARGET_HOURS = 4
-FEAT_FILE = "./data/features/btc_1h_features.parquet"
+BAR = "30T"              # варианты: "1H" (час), "30T" (полчаса), "1T" (минута)
+BARS_PER_HOUR = {"1H": 1, "30T": 2, "1T": 60}[BAR]
+
+TARGET_HOURS = 24        # бизнес-горизонт в ЧАСАХ
+MULTI_TARGET_HOURS = [1, 4]
+BASE_TF_MINUTES = 30
+TARGET_BARS  = TARGET_HOURS * BARS_PER_HOUR
+
+# config.py
+FEAT_FILE = f"./data/features/btc_{BASE_TF_MINUTES}m_features.parquet"
+PX_FILE   = "./data/interim/btc_prices.parquet"
 NEWS_FILE = "./data/interim/news_counts.parquet"
+
+# === BAR / TARGET ===
+BAR = "30T"              # варианты: "1H" (час), "30T" (полчаса), "1T" (минута)
+BARS_PER_HOUR = {"1H": 1, "30T": 2, "1T": 60}[BAR]
+
+# === NEWS SHOCK ===
+NEWS_LAG_MIN = 5          # сдвиг новости (минуты) до попадания в рынок
+NEWS_DECAY_MIN = 90       # эксп. распад импульса новости (мин)
+NEWS_MAX_PER_HOUR = 20    # нормализация счётчика в [0..1] (поджать всплески)
+
+# === ПУТИ (если ещё не заданы) ===
+OI_FILE = ""              # если используешь
+FUND_FILE = ""            # если используешь
+
+# config.py (добавь)
+FEATURE_FLAGS = {
+    "USE_DERIVS": True,
+    "USE_DIVERGENCE": True,
+    "USE_NEWS": True,
+    "USE_MACRO": False,      # включим позже
+    "USE_GLOBAL_META": True,
+    "USE_MICROSTRUCTURE": True,  # 1m → базовый TF
+}
+
+VOL_WEIGHT_ALPHA = 1.0  # 0.0 чтобы выключить
+UP_THR_PCT = {1: 0.002, 4: 0.005, 24: 0.02}
