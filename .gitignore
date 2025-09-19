@@ -1,19 +1,50 @@
+# === Python cache & venv ===
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+*.so
 *.egg-info/
-build/
-dist/
 .venv/
 venv/
+env/
+
+# === IDE ===
 .idea/
 .vscode/
-out/
-logs/
-*.log
-*.pid
-*.xlsx
-*.csv
+*.iml
+
+# === OS files ===
 .DS_Store
 Thumbs.db
+
+# === Logs & reports ===
+logs/
+*.log
+
+# === Data & checkpoints ===
+data/external/
+data/interim/
+data/raw/
+*.csv
+*.parquet
+*.h5
+*.db
+
+# === Models & weights ===
+models/*.pt
+models/*.pkl
+models/*.ckpt
+*.joblib
+
+# === Archives / Large files ===
+*.zip
+*.tar
+*.gz
+
+# === Notebooks ===
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# === WhyLogs local outputs ===
+logs/whylogs/
