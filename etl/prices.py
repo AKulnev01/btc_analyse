@@ -18,6 +18,30 @@ def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
     d = d.sort_index()
     return d
 
+def _norm_bar(bar: str) -> str:
+    bar = str(bar)
+    if bar.endswith("T"):   # '30T' -> '30min'
+        return f"{bar[:-1]}min"
+    return bar
+
+def _maybe_resample(df: pd.DataFrame, bar: str) -> pd.DataFrame:
+    d = df.copy()
+    try:
+        infer = pd.infer_freq(d.index)
+    except Exception:
+        infer = None
+    # сравниваем нормализованные частоты
+    if infer and _norm_bar(infer) == _norm_bar(bar):
+        return d
+    d = (
+        d.resample(_norm_bar(bar))
+         .agg(OHLC_AGG)
+         .dropna(subset=["open","high","low","close"])
+    )
+    if "volume" not in d.columns:
+        d["volume"] = 0.0
+    return d
+
 def _maybe_resample(df: pd.DataFrame, bar: str) -> pd.DataFrame:
     """Ресемплим к нужной сетке BAR, если исходные данные не совпадают."""
     d = df.copy()

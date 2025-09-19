@@ -1,42 +1,62 @@
+# etl/fred.py
+import os
 import requests
 import pandas as pd
-import config as CFG
+from pathlib import Path
 
-FRED_KEY = CFG.FRED_API_KEY
+CACHE_DIR = Path("data/external/fred")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 BASE = "https://api.stlouisfed.org/fred/series/observations"
 
-# подберём несколько полезных серий (можно расширять)
-SERIES = {
-    "CPIAUCSL": "cpi",      # CPI (м/м) — здесь уровень, дальше можно брать pct_change
-    "UNRATE":   "unemp",    # Unemployment rate
-    "DFF":      "dff",      # Fed Funds rate
-    "T10Y2Y":   "t10y2y",   # 10Y-2Y Treasury spread
-    "ICSA":     "claims",   # Initial Jobless Claims
+# Топ полезных индикаторов
+FRED_SERIES = {
+    "DXY": "DTWEXBGS",        # US Dollar Index
+    "VIX": "VIXCLS",          # Volatility Index
+    "SP500": "SP500",         # S&P500 Index
+    "GOLD": "GOLDAMGBD228NLBM",  # Gold USD
 }
 
-def fred_series(series_id: str) -> pd.DataFrame:
-    params = dict(series_id=series_id, api_key=FRED_KEY, file_type="json", observation_start="2010-01-01")
-    r = requests.get(BASE, params=params, timeout=20); r.raise_for_status()
-    obs = r.json()["observations"]
+FRED_API_KEY = os.getenv("FRED_API_KEY")  # можно получить бесплатно на https://fred.stlouisfed.org/
+
+def _fetch_series(series_id: str) -> pd.DataFrame:
+    params = {
+        "series_id": series_id,
+        "file_type": "json",
+    }
+    if FRED_API_KEY:
+        params["api_key"] = FRED_API_KEY
+
+    r = requests.get(BASE, params=params, timeout=15)
+    r.raise_for_status()
+    js = r.json()
+
+    obs = js.get("observations", [])
     df = pd.DataFrame(obs)
-    df["timestamp"] = pd.to_datetime(df["date"], utc=True)
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    return df[["timestamp","value"]].set_index("timestamp").sort_index()
+    df["t"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+    df.set_index("t", inplace=True)
+    df = df.rename(columns={"value": series_id})[[series_id]]
+    df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
+    return df
 
-def fetch_fred_macro() -> pd.DataFrame:
-    out = []
-    for sid, name in SERIES.items():
-        df = fred_series(sid).rename(columns={"value": name})
-        out.append(df)
-    df = pd.concat(out, axis=1).sort_index()
-    # ресемплим в 1h, ffill «ступеньками»
-    df_h = df.resample("1h").ffill()
-    # производные признаки (z-score грубо, и изменения)
-    for c in df_h.columns:
-        df_h[f"{c}_chg"] = df_h[c].diff()
-    return df_h
+def load_fred_metrics(refresh: bool = False) -> pd.DataFrame:
+    cache_file = CACHE_DIR / "fred.parquet"
+    if cache_file.exists() and not refresh:
+        return pd.read_parquet(cache_file)
 
-if __name__ == "__main__":
-    df = fetch_fred_macro()
-    df.to_parquet(CFG.MACRO_FILE)
-    print(df.tail(3))
+    dfs = []
+    for alias, series_id in FRED_SERIES.items():
+        print(f"[fred] fetch {alias} ({series_id})")
+        try:
+            df = _fetch_series(series_id)
+            df = df.rename(columns={series_id: alias})
+            dfs.append(df)
+        except Exception as e:
+            print(f"[fred] fail {alias}: {e}")
+
+    if not dfs:
+        raise RuntimeError("Не удалось загрузить макро-индикаторы FRED")
+
+    out = pd.concat(dfs, axis=1).sort_index()
+    out.to_parquet(cache_file)
+    return out

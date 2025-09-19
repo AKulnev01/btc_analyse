@@ -1,8 +1,9 @@
 """Сборка фичей на базовой сетке (CFG.BASE_TF_MINUTES) и таргетов на несколько горизонтов.
 Создаёт: y_h1, y_h4, y_h24 и алиас y = y_h{CFG.TARGET_HOURS}.
-Включены: цены/деривы/время/вола/дивергенции/новости/глобальные метрики + лёгкие head-фичи.
+Включены: цены/деривы/время/вола/дивергенции/новости/глобальные метрики + внешние (ончейн/фандинг/новсентимент) + лёгкие head-фичи.
 """
 from typing import Optional, List
+import os
 import numpy as np
 import pandas as pd
 
@@ -13,12 +14,14 @@ from etl.news import load_news_counts
 from etl.vol_indices import realized_vol
 from indicators.divergence import detect_divergence
 
+
 # ----------------------
 # ВСПОМОГАТЕЛЬНЫЕ
 # ----------------------
 def _steps(hours: int) -> int:
     base_min = int(getattr(CFG, "BASE_TF_MINUTES", 60))
     return max(1, int(round(hours * 60.0 / base_min)))
+
 
 def _time_feats(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
@@ -28,6 +31,7 @@ def _time_feats(df: pd.DataFrame) -> pd.DataFrame:
     d["cos_h"] = np.cos(2 * np.pi * d["hod"] / 24.0)
     dow_oh = pd.get_dummies(d["dow"], prefix="dow", dtype="int8")
     return pd.concat([d, dow_oh], axis=1)
+
 
 def _rolling(px: pd.DataFrame) -> pd.DataFrame:
     d = px.copy()
@@ -40,6 +44,7 @@ def _rolling(px: pd.DataFrame) -> pd.DataFrame:
     d["atr_24h"] = (d["high"] - d["low"]).rolling(_steps(24), min_periods=max(12, _steps(6))).mean()
     d["vol_of_vol"] = d["vol_24h"].rolling(_steps(24), min_periods=max(12, _steps(6))).std()
     return d
+
 
 def _head_extra_feats(df: pd.DataFrame) -> pd.DataFrame:
     """Дешёвые фичи для бинарных голов и коротких горизонтов."""
@@ -62,6 +67,7 @@ def _head_extra_feats(df: pd.DataFrame) -> pd.DataFrame:
     d["dist_to_min7d"] = (d["close"] / roll_min) - 1.0
     return d
 
+
 def _ensure_sigma(df: pd.DataFrame) -> pd.DataFrame:
     """Если нет sigma_7d / sigma_ewma_7d — посчитаем из базовых рентов."""
     d = df.copy()
@@ -71,6 +77,18 @@ def _ensure_sigma(df: pd.DataFrame) -> pd.DataFrame:
     if "sigma_ewma_7d" not in d.columns:
         d["sigma_ewma_7d"] = r.ewm(halflife=_steps(84), min_periods=max(24, _steps(12))).std()
     return d
+
+
+def _safe_join(left: pd.DataFrame, right: Optional[pd.DataFrame], how="left") -> pd.DataFrame:
+    """джойн, который молча пропускает отсутствующие/пустые таблицы"""
+    if right is None or isinstance(right, pd.DataFrame) and right.empty:
+        return left
+    # приводим индекс к UTC DatetimeIndex для единообразия
+    if right.index.tz is None:
+        right = right.copy()
+        right.index = pd.to_datetime(right.index, utc=True)
+    return left.join(right, how=how)
+
 
 # ----------------------
 # ОСНОВНОЙ БИЛДЕР
@@ -95,63 +113,117 @@ def build_feature_table(
     # 1) цены
     px = load_btc_prices(price_path)
     base = px.copy().sort_index()
+    if base.index.tz is None:
+        base.index = pd.to_datetime(base.index, utc=True)
 
-    # 2) деривы (опционально)
+    # 2) деривы (Bybit OI/funding — если используешь)
     try:
-        dv = load_bybit_derivs(oi_path, funding_path)
-        base = base.join(dv, how="left")
-    except Exception:
-        pass
+        if getattr(CFG, "FEATURE_FLAGS", {}).get("USE_DERIVS", True):
+            dv = load_bybit_derivs(oi_path, funding_path)
+            base = base.join(dv, how="left")
+    except Exception as e:
+        print(f"[WARN] derivs join: {e}")
 
     # 3) RSI/дивергенции (опц.)
     try:
-        div = detect_divergence(base[["close"]].dropna(), rsi_period=14, lb=max(48, _steps(24)))
-        base = base.join(div, how="left")
-    except Exception:
-        pass
+        if getattr(CFG, "FEATURE_FLAGS", {}).get("USE_DIVERGENCE", True):
+            div = detect_divergence(base[["close"]].dropna(), rsi_period=14, lb=max(48, _steps(24)))
+            base = base.join(div, how="left")
+    except Exception as e:
+        print(f"[WARN] divergence: {e}")
 
     # 4) вола/окна/время
-    base["rv"] = realized_vol(px)  # функция должна уметь работать на базовом шаге (или ок)
+    base["rv"] = realized_vol(px)  # функция должна уметь работать на базовом шаге
     base = _rolling(base)
     base = _time_feats(base)
 
-    # 5) новости (агрегаты)
-    if news_path:
+    # 5) новости-«счётчики» (если есть твой news_counts)
+    if news_path and getattr(CFG, "FEATURE_FLAGS", {}).get("USE_NEWS", True):
         try:
-            news = load_news_counts(news_path)  # уже resample-нутая в 1H — приведём к base через ffill
+            news = load_news_counts(news_path)  # обычно уже на 1H; приведём к base через ffill
             news = news.reindex(base.index, method="ffill")
             base = base.join(news, how="left").fillna({c: 0 for c in news.columns})
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] news_counts: {e}")
+
+    # 5.1) новостной сентимент (новый кэш)
+    if getattr(CFG, "FEATURE_FLAGS", {}).get("USE_NEWS_SENTI", True):
+        try:
+            sf = getattr(CFG, "SENTI_FILE", "")
+            if sf and os.path.exists(sf):
+                senti = pd.read_parquet(sf)
+                if senti.index.tz is None:
+                    senti.index = pd.to_datetime(senti.index, utc=True)
+                # приведём к сетке base ffill-ом (редкие агрегаты)
+                senti = senti.reindex(base.index, method="ffill")
+                base = base.join(senti, how="left")
+        except Exception as e:
+            print(f"[WARN] news_sentiment join: {e}")
 
     # 6) макро (если передали)
-    if macro_df is not None:
+    if macro_df is not None and getattr(CFG, "FEATURE_FLAGS", {}).get("USE_MACRO", False):
         try:
+            macro_df = macro_df.copy()
+            if macro_df.index.tz is None:
+                macro_df.index = pd.to_datetime(macro_df.index, utc=True)
             macro_df = macro_df.reindex(base.index, method="ffill")
             base = base.join(macro_df, how="left")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] macro join: {e}")
 
-    # 7) глобальные метрики
+    # 7) глобальные метрики (как у тебя было)
     try:
-        gm = pd.read_parquet("data/interim/global_meta.parquet")
-        gm = gm.reindex(base.index, method="ffill")
-        base = base.join(gm, how="left")
-    except Exception:
-        pass
+        if getattr(CFG, "FEATURE_FLAGS", {}).get("USE_GLOBAL_META", True):
+            gm_path = getattr(CFG, "GLOBAL_META_FILE", "data/interim/global_meta.parquet")
+            if gm_path and os.path.exists(gm_path):
+                gm = pd.read_parquet(gm_path)
+                if gm.index.tz is None:
+                    gm.index = pd.to_datetime(gm.index, utc=True)
+                gm = gm.reindex(base.index, method="ffill")
+                base = base.join(gm, how="left")
+    except Exception as e:
+        print(f"[WARN] global_meta: {e}")
+
+    # 8) ВНЕШНИЕ НОВЫЕ ИСТОЧНИКИ (ончейн/фандинг-кроссбиржевой)
+    # on-chain (Glassnode bundle)
+    if getattr(CFG, "FEATURE_FLAGS", {}).get("USE_ONCHAIN", True):
+        try:
+            oc_path = getattr(CFG, "ONCHAIN_FILE", "")
+            if oc_path and os.path.exists(oc_path):
+                onchain = pd.read_parquet(oc_path)
+                base = _safe_join(base, onchain, how="left")
+        except Exception as e:
+            print(f"[WARN] onchain join: {e}")
+
+    # funding (Binance/Bybit/OKX + агрегаты)
+    if getattr(CFG, "FEATURE_FLAGS", {}).get("USE_FUNDING", True):
+        try:
+            f_path = getattr(CFG, "FUNDING_FILE", "")
+            if f_path and os.path.exists(f_path):
+                funding_all = pd.read_parquet(f_path)
+                # сгладим быстрые шумы и добавим простые производные
+                for c in funding_all.columns:
+                    if "funding" in c:
+                        funding_all[c + "_ema"] = funding_all[c].ewm(span=12, min_periods=3).mean()
+                base = _safe_join(base, funding_all, how="left")
+        except Exception as e:
+            print(f"[WARN] funding join: {e}")
 
     # медленные каналы тянем вперёд
-    slow_cols = [c for c in base.columns if c.startswith("oi") or c.startswith("fund") or "dominance" in c or "market_cap" in c]
+    slow_cols = [c for c in base.columns if c.startswith("oi")
+                 or c.startswith("fund")
+                 or "dominance" in c
+                 or "market_cap" in c]
     if slow_cols:
         base[slow_cols] = base[slow_cols].ffill()
 
-    # 8) extra фичи
+    # 9) extra фичи
     base = _head_extra_feats(base)
 
-    # 9) сигмы
+    # 10) сигмы
     base = _ensure_sigma(base)
 
-    # 10) несколько таргетов
+    # 11) несколько таргетов
     for h in multi_hours:
         k = _steps(h)
         base[f"y_h{h}"] = np.log(base["close"].shift(-k)) - np.log(base["close"])
@@ -161,7 +233,7 @@ def build_feature_table(
     if alias_col in base.columns:
         base["y"] = base[alias_col]
 
-    # 11) чистка обязательных колонок
+    # 12) чистка обязательных колонок (требовательная часть)
     required = [
         "y", "ret_1h", "ret_4h", "ret_1d", "vol_24h", "atr_24h", "rv",
         "sin_h", "cos_h", "open", "high", "low", "close", "volume",
